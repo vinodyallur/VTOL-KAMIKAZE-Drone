@@ -1,0 +1,18 @@
+# Arduino / arduino-cli build outputs
+build_fc/
+build_tx/
+drone_fc/build/
+drone_tx/build/
+
+# Compiled binaries and intermediates
+*.bin
+*.elf
+*.map
+*.merged.bin
+
+# Large third-party tool binary (download separately, see README)
+tools/arduino-cli.exe
+
+# OS / editor cruft
+Thumbs.db
+.DS_Store
