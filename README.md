@@ -15,6 +15,7 @@ A two-board ESP32 quadcopter / VTOL build:
 |------|---------|
 | `drone_fc/drone_fc.ino` | Flight-controller (receiver) firmware — classic ESP32 |
 | `drone_tx/drone_tx.ino` | Transmitter firmware — ESP32-C3 Supermini |
+| `docs/WIRING.md` | **Full wiring & connection diagrams** (both boards + power) |
 | `flash.ps1` | Flash a compiled sketch to the correct board (auto-detects by USB VID) |
 | `tools/read_serial.ps1` | Serial-monitor helper |
 | `_anglemode_backup/` | Earlier advanced angle-mode PID sketches (reference) |
@@ -24,6 +25,9 @@ in (see `.gitignore`).
 
 ## Hardware
 
+> 📐 **Full wiring tables + connection diagrams (with power distribution) are in
+> [`docs/WIRING.md`](docs/WIRING.md).** The quick reference below is a summary.
+
 ### Boards
 | Role | Board | USB bridge | Identify by |
 |------|-------|-----------|-------------|
@@ -31,8 +35,8 @@ in (see `.gitignore`).
 | TX | ESP32-C3 Supermini | native USB-Serial/JTAG (VID `0x303A`) | USB VID |
 
 ### Flight controller (classic ESP32) pins
-- **nRF24L01:** CE = GPIO4, CSN = GPIO5 (default VSPI for SCK/MISO/MOSI)
-- **MPU6050 (I2C):** SDA = GPIO21, SCL = GPIO22, 3.3 V, GND (needs pull-ups)
+- **nRF24L01:** CE = GPIO4, CSN = GPIO5 (default VSPI: SCK = GPIO18, MISO = GPIO19, MOSI = GPIO23)
+- **MPU6050 (I2C):** SDA = GPIO21, SCL = GPIO22, AD0 = GND, 3.3 V, GND (needs pull-ups)
 - **ESCs:** GPIO14 = Left-Front, GPIO27 = Left-Rear, GPIO26 = Right-Front,
   GPIO25 = Right-Rear
 
@@ -49,11 +53,13 @@ in (see `.gitignore`).
 - **8-byte packet (identical on both MCUs):**
   `{ uint16 throttle (0..1023); int16 yaw; int16 pitch; int16 roll; }`
   yaw/pitch/roll are centered (−512..511).
-- **Throttle (ratchet / peak-hold):** starts at 0 (motors off). Raising the stick
-  increases the motors and *holds* the highest level reached; bringing the stick
-  to the middle drops to mid speed; bringing it fully down turns the motors off.
-- **Throttle mapping** is fixed so idle = 0 (motors off at every power-up), with a
-  pull-up so a disconnected throttle wire reads idle instead of floating.
+- **Throttle (hover — direct proportional):** stick position maps straight to
+  motor thrust, smoothed by a slew limit so big moves don't surge. Park the stick
+  at the hover point and the drone holds that thrust while the PID keeps it level
+  → it hovers. Below ~3 % stick the motors are fully off. (No barometer, so this
+  holds **thrust**, not a fixed altitude — trim by hand as the battery sags.)
+- **Throttle mapping** is fixed on the TX so idle = 0 (motors off at every
+  power-up), with a pull-up so a disconnected throttle wire reads idle.
 - **Stabilization (PID + MPU6050):** the FC fuses the accelerometer and gyro with
   a complementary filter for clean roll/pitch angles, then runs **angle-mode PID**
   on roll & pitch (stick = desired lean angle, the IMU holds it) and **rate-mode
