@@ -54,11 +54,46 @@ in (see `.gitignore`).
   to the middle drops to mid speed; bringing it fully down turns the motors off.
 - **Throttle mapping** is fixed so idle = 0 (motors off at every power-up), with a
   pull-up so a disconnected throttle wire reads idle instead of floating.
-- **Self-leveling:** the FC uses the MPU6050 to correct roll & pitch. With the IMU
-  absent, those corrections are forced to 0 (manual stick control still works).
-- **Failsafe:** if the radio link drops, the FC cuts throttle and sticks to off.
+- **Stabilization (PID + MPU6050):** the FC fuses the accelerometer and gyro with
+  a complementary filter for clean roll/pitch angles, then runs **angle-mode PID**
+  on roll & pitch (stick = desired lean angle, the IMU holds it) and **rate-mode
+  PID** on yaw. Gyro bias and mounting tilt are auto-calibrated at boot (keep the
+  drone still & level). Tune `pidRoll` / `pidPitch` / `pidYaw` in
+  `drone_fc/drone_fc.ino`. With the IMU absent it falls back to manual stick
+  passthrough so it still flies (no auto-leveling).
+- **Failsafe:** if the radio link drops, the FC cuts throttle and sticks to off
+  and dumps the PID integrators.
 - **Auto-reconnect:** the TX re-inits the radio after repeated write failures —
   no reset required.
+
+### PID tuning (props OFF!)
+1. Start with the defaults. With props off, tilt the drone by hand and watch the
+   serial `ang r= p=` and `corr R: P: Y:` values — the corrections should oppose
+   the tilt.
+2. Raise `kp` until it holds firmly / fights tilt strongly; if it oscillates,
+   back off ~20%.
+3. Add `kd` to damp the wobble/overshoot.
+4. Add a little `ki` to remove slow drift. The integral is clamped and reset on
+   failsafe to prevent windup.
+
+## Known notes / troubleshooting
+
+### Upload fails: "chip stopped responding" / "No serial data received"
+The classic ESP32's auto-reset into download mode can fail (especially with extra
+load on the 3.3 V rail). If `flash.ps1 fc` keeps failing to connect:
+- **Hold the BOOT (IO0) button** on the FC, start the flash, and release BOOT
+  once you see writing %. This is the reliable fix.
+- Make sure **nothing is wired to GPIO0 or GPIO2** (strapping pins) — a stray
+  wire there blocks download mode.
+- If it flashed fine before and stopped after adding a peripheral, temporarily
+  **unplug that peripheral's VCC**, flash, then reconnect.
+
+### MPU6050 reads `FAILED` (`mpu:0`)
+- Wiring: **SDA = GPIO21, SCL = GPIO22, VCC = 3.3V, GND = GND**.
+- Tie **AD0 = GND** so the I2C address is `0x68` (what the firmware expects).
+- Add/confirm SDA & SCL **pull-ups** to 3.3V (most GY-521 breakouts have them).
+- Without the IMU the firmware still flies in manual passthrough, but **PID
+  stabilization is disabled**.
 
 ## Build & flash (Windows / PowerShell)
 
@@ -79,10 +114,8 @@ These scripts expect `arduino-cli.exe` in `tools/` (download it from
 > The classic ESP32 can corrupt uploads at 921600 baud; `flash.ps1` uses
 > `UploadSpeed=115200` for the FC. The C3 flashes fine at 921600 over native USB.
 
-## Known notes / troubleshooting
+## More notes
 
-- **MPU6050 reads `FAILED`** → check SDA = 21 / SCL = 22 wiring, pull-ups, 3.3 V,
-  GND. Without it, self-leveling is disabled but manual control still works.
 - The C3's native USB resets when the serial port is opened; verify TX behavior
   indirectly via the FC's received values (`link:1`, `T:` …) rather than reading
   the C3 directly.
