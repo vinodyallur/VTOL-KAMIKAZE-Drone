@@ -142,10 +142,66 @@ void setup() {
   Wire.setClock(400000);
   Wire.setTimeOut(10);             // a dead IMU must not stall the loop
 
+  // --- I2C bus scan: tells us exactly what (if anything) is wired up ---
+  Serial.println("Scanning I2C bus...");
+  uint8_t mpuAddr = 0;
+  int found = 0;
+  for (uint8_t a = 1; a < 127; a++) {
+    Wire.beginTransmission(a);
+    if (Wire.endTransmission() == 0) {
+      found++;
+      Serial.printf("  found I2C device @ 0x%02X\n", a);
+      if (a == 0x68 || a == 0x69) mpuAddr = a;   // MPU6050 lives at 0x68 (AD0=GND) or 0x69 (AD0=VCC)
+    }
+  }
+  if (found == 0)
+    Serial.println("  no I2C devices! -> check SDA=21, SCL=22 (not swapped), VCC=3.3V, GND, pull-ups");
+
+  // --- MPU init at the detected address (fall back to 0x68) ---
+  if (mpuAddr == 0) mpuAddr = 0x68;
+
+  // Read raw WHO_AM_I (reg 0x75) BEFORE init so we know what chip this is.
+  // Many "MPU6050" modules are actually MPU6500/MPU9250 (WHO_AM_I 0x70/0x71).
+  // They share the same accel/gyro data registers and scaling, so they work
+  // fine for us even though the MPU6050 library's testConnection() rejects them.
+  uint8_t whoami = 0xFF;
+  Wire.beginTransmission(mpuAddr);
+  Wire.write(0x75);
+  if (Wire.endTransmission(false) == 0 && Wire.requestFrom((int)mpuAddr, 1) == 1)
+    whoami = Wire.read();
+
+  mpu = MPU6050(mpuAddr);
   mpu.initialize();
-  mpuOk = mpu.testConnection();
-  Serial.print("MPU6050 connection: ");
-  Serial.println(mpuOk ? "OK" : "FAILED <-- check SDA=21/SCL=22 wiring, pull-ups, 3.3V, GND");
+  // Force the chip out of sleep (PWR_MGMT_1=0x6B -> 0x00) in case a clone's
+  // initialize() left the sleep bit set.
+  Wire.beginTransmission(mpuAddr);
+  Wire.write(0x6B);
+  Wire.write(0x00);
+  Wire.endTransmission();
+
+  bool answered = (whoami != 0x00 && whoami != 0xFF);
+  bool knownId   = (whoami == 0x68 || whoami == 0x70 || whoami == 0x71 ||
+                    whoami == 0x73 || whoami == 0x75 || whoami == 0x98);
+  mpuOk = mpu.testConnection() || (answered && knownId);
+
+  const char* chip = "unknown";
+  if (whoami == 0x68) chip = "MPU6050";
+  else if (whoami == 0x70) chip = "MPU6500";
+  else if (whoami == 0x71) chip = "MPU9250";
+  else if (whoami == 0x73) chip = "MPU9255";
+  else if (whoami == 0x98) chip = "MPU6886";
+  Serial.printf("MPU @ 0x%02X  WHO_AM_I=0x%02X (%s)  -> %s\n",
+                mpuAddr, whoami, chip, mpuOk ? "OK" : "FAILED");
+  if (mpuOk) {
+    int16_t tax, tay, taz, tgx, tgy, tgz;
+    mpu.getMotion6(&tax, &tay, &taz, &tgx, &tgy, &tgz);
+    Serial.printf("  sample ax=%d ay=%d az=%d gx=%d gy=%d gz=%d (az~16384 when level)\n",
+                  tax, tay, taz, tgx, tgy, tgz);
+  } else if (whoami == 0xFF) {
+    Serial.println("  chip not answering -> wiring/power (SDA=21, SCL=22, 3.3V, GND, pull-ups)");
+  } else {
+    Serial.println("  unrecognized WHO_AM_I -> tell me this value so I can add support");
+  }
 
   esc1.attach(escPin1, 1000, 2000);
   esc2.attach(escPin2, 1000, 2000);

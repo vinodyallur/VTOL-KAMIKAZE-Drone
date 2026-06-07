@@ -89,11 +89,22 @@ load on the 3.3 V rail). If `flash.ps1 fc` keeps failing to connect:
   **unplug that peripheral's VCC**, flash, then reconnect.
 
 ### MPU6050 reads `FAILED` (`mpu:0`)
-- Wiring: **SDA = GPIO21, SCL = GPIO22, VCC = 3.3V, GND = GND**.
-- Tie **AD0 = GND** so the I2C address is `0x68` (what the firmware expects).
-- Add/confirm SDA & SCL **pull-ups** to 3.3V (most GY-521 breakouts have them).
-- Without the IMU the firmware still flies in manual passthrough, but **PID
+The firmware runs an **I2C bus scan at boot** — open the serial monitor right
+after reset to see it. Common cases:
+- **No I2C devices found** → wiring/power: **SDA = GPIO21, SCL = GPIO22,
+  VCC = 3.3V, GND = GND**, tie **AD0 = GND** (address `0x68`), and confirm SDA &
+  SCL **pull-ups** to 3.3V (most GY-521 breakouts have them). SDA/SCL not swapped.
+- **Device found at 0x68 but `WHO_AM_I` ≠ 0x68** → your "MPU6050" is really an
+  **MPU6500 (0x70)**, MPU9250 (0x71), etc. These are register-compatible, so the
+  firmware now **auto-accepts** WHO_AM_I `0x68/0x70/0x71/0x73/0x75/0x98` and reads
+  them normally. If you see an unrecognized value, report it and it can be added.
+- Without a working IMU the firmware still flies in manual passthrough, but **PID
   stabilization is disabled**.
+
+> **Pre-flight (props OFF!):** after `mpu:1`, tilt the drone by hand and watch the
+> `M:` motor values — the motors on the **low** side must speed up to push it back
+> level. If they speed up on the *high* side instead, the correction sign is
+> inverted (you'd flip on takeoff) — swap the affected axis in the mixing.
 
 ## Build & flash (Windows / PowerShell)
 
