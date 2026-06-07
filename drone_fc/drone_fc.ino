@@ -15,6 +15,15 @@
   Motors (X layout):  esc1 = Left Front, esc2 = Left Rear,
                       esc3 = Right Front, esc4 = Right Rear
 
+  Throttle (hover): direct proportional + smoothed. Hold the stick at the hover
+  point and the drone holds that thrust while the PID keeps it level -> it hovers.
+  (No barometer, so this holds THRUST, not a fixed altitude; trim the throttle by
+  hand as the battery sags.)
+
+  Mounting the IMU: flat & parallel to the frame, CHIP-SIDE UP (az ~ +16384 when
+  level), X axis pointing to the FRONT, near the CG, on a little foam to damp
+  motor vibration. Boot prints an orientation check - heed its warnings.
+
   >> TUNE PID gains pidRoll/pidPitch/pidYaw below. Always test with props OFF. <<
 */
 
@@ -96,15 +105,14 @@ const int   CORR_LIMIT   = 400;       // max us correction per axis
 const float kManual = 0.40;
 const float kYaw    = 0.40;
 
-// ---------------- Throttle ratchet / peak-hold ----------------
-// Position-based throttle (starts at 0 = motors off):
-//   - raise the stick      -> motors rise and HOLD the highest level reached
-//   - bring it to the middle-> motors drop to mid speed
-//   - bring it fully down   -> motors turn off
-const int THR_MID     = 512;         // middle of the 0..1023 throttle range
-const int THR_MIDBAND = 60;          // +/- window that counts as "middle"
-const int THR_OFF     = 60;          // at/below this = "full below" -> off
-int heldThrottle = 0;                // level we hold (0 = off at power-up)
+// ---------------- Throttle (direct proportional, smoothed) ----------------
+// Stick position maps straight to motor thrust, so the drone HOLDS whatever
+// thrust you set: raise the stick to the hover point and leave it there, and the
+// PID keeps it level -> it hovers. (No barometer, so this holds THRUST, not a
+// fixed altitude; nudge the throttle as the battery sags.)
+const int   THR_MIN_ON        = 30;     // stick below this (~3%) = motors fully off
+const float THR_SLEW_US_PER_S = 1200;   // max thrust ramp -> smooth, no surge
+float baseSmooth = 1000;                // smoothed motor base (1000 = off)
 
 // Calibrate the IMU at power-up: average the gyro to find its zero-rate bias and
 // the accelerometer to find the resting (mounting) tilt. Keep the drone STILL and
@@ -116,9 +124,11 @@ void autoCalibrate() {
   const int N = 600;
   double sgx = 0, sgy = 0, sgz = 0;     // gyro sums (for bias)
   double sr = 0, sp = 0;                // accel-angle sums (for level trim)
+  double sax = 0, say = 0, saz = 0;     // accel sums (for orientation check)
   for (int i = 0; i < N; i++) {
     mpu.getMotion6(&ax, &ay, &az, &gx, &gy, &gz);
     sgx += gx; sgy += gy; sgz += gz;
+    sax += ax; say += ay; saz += az;
     sr += atan2((float)ay, (float)az) * 180.0 / PI;
     sp += atan2(-(float)ax, sqrt((float)ay * ay + (float)az * az)) * 180.0 / PI;
     delay(2);
@@ -133,6 +143,18 @@ void autoCalibrate() {
 
   Serial.printf("Gyro bias: gx=%.1f gy=%.1f gz=%.1f | Level trim: roll0=%.1f pitch0=%.1f\n",
     gxBias, gyBias, gzBias, rollTrim, pitchTrim);
+
+  // --- Orientation sanity check: when level, gravity must sit on +Z (az large &
+  // positive). Catches an upside-down or sideways mount BEFORE you take off. ---
+  double mAx = sax / N, mAy = say / N, mAz = saz / N;
+  if (mAz < 0)
+    Serial.println("WARNING: MPU UPSIDE DOWN (az<0) -> roll/pitch inverted = FLIP RISK. "
+                   "Mount it chip-side UP.");
+  else if (fabs(mAx) > fabs(mAz) || fabs(mAy) > fabs(mAz))
+    Serial.println("WARNING: MPU not flat (a side axis sees gravity) -> mount it parallel "
+                   "to the frame.");
+  else
+    Serial.println("Orientation OK: gravity on +Z (flat, right-side up).");
 }
 
 void setup() {
@@ -243,38 +265,32 @@ void loop() {
   // ===== FAILSAFE: no link -> motors off and cut the sticks =====
   if (!signalOk) {
     throttleCmd = 0; yawCmd = pitchCmd = rollCmd = 0;
-    heldThrottle = 0;
+    baseSmooth = 1000;                    // cut thrust immediately (no ramp)
     iRoll = iPitch = iYaw = 0;            // dump PID integrals so it can't wind up
   }
 
-  // ===== THROTTLE: ratchet peak-hold with middle / off detents =====
-  // Rising stick raises the held level and keeps the highest. Lowering does
-  // nothing until the stick reaches the middle (-> mid speed) or the very
-  // bottom (-> off). So small dips don't cut thrust, but you can always step
-  // down to mid or stop by bringing the stick to those positions.
-  if (throttleCmd <= THR_OFF) {
-    heldThrottle = 0;                              // stick fully down -> off
-  } else if (throttleCmd > heldThrottle) {
-    heldThrottle = throttleCmd;                    // rising -> hold the new peak
-  } else if (abs(throttleCmd - THR_MID) <= THR_MIDBAND) {
-    heldThrottle = THR_MID;                        // brought to middle -> mid speed
-  }
-  // otherwise: keep the last highest level (hold)
-  int effThrottle = heldThrottle;
-
-  // ===== THROTTLE -> motor base (spins the instant you raise it) =====
-  int baseThrottle;
-  if (effThrottle < 20) baseThrottle = 1000;                            // off
-  else baseThrottle = map(effThrottle, 20, 1023, minThrottle, maxThrottle);
-  bool flying = baseThrottle > minThrottle;   // only stabilize once actually spun up
-
-  // ===== IMU: read accel + gyro, fuse into clean angles =====
-  // dt is the real elapsed time so the filter and PID are frame-rate independent.
+  // ===== TIMING: real elapsed dt (shared by throttle smoothing, filter, PID) =====
   unsigned long nowUs = micros();
   float dt = (nowUs - lastLoopUs) * 1e-6f;
   lastLoopUs = nowUs;
-  if (dt <= 0 || dt > 0.05f) dt = 0.005f;     // guard against a bad first/!long step
+  if (dt <= 0 || dt > 0.05f) dt = 0.005f;     // guard against a bad first / long step
 
+  // ===== THROTTLE -> motor base (direct proportional, smoothed) =====
+  // Stick position = thrust. Leave the stick at the hover point and the drone
+  // holds that thrust while the PID keeps it level -> it hovers. The slew limit
+  // eases big stick moves so it settles instead of surging.
+  int targetBase;
+  if (throttleCmd < THR_MIN_ON) targetBase = 1000;                       // off
+  else targetBase = map(throttleCmd, THR_MIN_ON, 1023, minThrottle, maxThrottle);
+
+  float maxStep = THR_SLEW_US_PER_S * dt;     // most the thrust may change this frame
+  if      (targetBase > baseSmooth + maxStep) baseSmooth += maxStep;
+  else if (targetBase < baseSmooth - maxStep) baseSmooth -= maxStep;
+  else                                        baseSmooth  = targetBase;
+  int baseThrottle = (int)baseSmooth;
+  bool flying = baseThrottle > minThrottle;   // only stabilize once actually spun up
+
+  // ===== IMU: read accel + gyro, fuse into clean angles =====
   if (mpuOk) {
     mpu.getMotion6(&ax, &ay, &az, &gx, &gy, &gz);
     // Gyro -> deg/s (bias removed). gx=roll, gy=pitch, gz=yaw for a flat mount.
@@ -362,8 +378,8 @@ void loop() {
   static unsigned long dbg = 0;
   if (millis() - dbg > 500) {
     dbg = millis();
-    Serial.printf("link:%d mpu:%d held:%d | T:%d Y:%d P:%d R:%d | ang r=%.1f p=%.1f | corr R:%d P:%d Y:%d | M:%d/%d/%d/%d\n",
-      signalOk, mpuOk, heldThrottle, throttleCmd, yawCmd, pitchCmd, rollCmd,
+    Serial.printf("link:%d mpu:%d base:%d | T:%d Y:%d P:%d R:%d | ang r=%.1f p=%.1f | corr R:%d P:%d Y:%d | M:%d/%d/%d/%d\n",
+      signalOk, mpuOk, baseThrottle, throttleCmd, yawCmd, pitchCmd, rollCmd,
       roll, pitch, rollCorr, pitchCorr, yawCorr,
       motorLeftFront, motorLeftRear, motorRightFront, motorRightRear);
   }
