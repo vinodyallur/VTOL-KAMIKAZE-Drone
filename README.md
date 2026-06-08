@@ -138,3 +138,7 @@ These scripts expect `arduino-cli.exe` in `tools/` (download it from
   the C3 directly.
 - If pitch/roll feel swapped, exchange `PIN_PITCH` / `PIN_ROLL` in
   `drone_tx/drone_tx.ino`.
+
+## Star History
+
+[![Star History Chart](https://api.star-history.com/svg?repos=vinodyallur/VTOL-KAMIKAZE-Drone&type=Date)](https://star-history.com/#vinodyallur/VTOL-KAMIKAZE-Drone&Date)
