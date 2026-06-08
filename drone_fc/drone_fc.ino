@@ -29,6 +29,7 @@
 
 #include <Wire.h>
 #include <MPU6050.h>
+#include <Adafruit_BMP280.h>
 #include <SPI.h>
 #include <nRF24L01.h>
 #include <RF24.h>
@@ -39,11 +40,12 @@
 RF24 radio(4, 5);                  // CE=GPIO4, CSN=GPIO5
 const byte address[6] = "00001";
 
-struct DataPacket {
+struct __attribute__((packed)) DataPacket {
   uint16_t throttle;               // 0..1023 (throttle stick)
   int16_t  yaw;                    // -512..511 (centered)
   int16_t  pitch;                  // -512..511 (centered)
   int16_t  roll;                   // -512..511 (centered)
+  uint8_t  hold;                   // 1 = altitude-hold switch pressed (throttle-stick button)
 };
 DataPacket receivedData;
 
@@ -69,6 +71,27 @@ float rollTrim = 0, pitchTrim = 0;
 const float COMP_ALPHA = 0.98;
 unsigned long lastLoopUs = 0;          // for the real dt used by the filter + PID
 
+// ---------------- BMP280 barometer (optional, for altitude hold) ----------------
+// Shares the I2C bus with the MPU6050. Tie SDO->GND for address 0x76 (or VCC=0x77),
+// and CSB->3.3V so it stays in I2C mode. If it isn't found, altitude hold is just
+// disabled and everything else flies normally.
+Adafruit_BMP280 bmp;                   // I2C
+bool  bmpOk = false;
+float altRaw = 0, altFilt = 0, altVel = 0;     // metres, filtered metres, m/s
+const float SEA_LEVEL_HPA = 1013.25;           // only relative altitude matters here
+unsigned long lastBaroUs = 0;
+
+// Altitude-hold state (engaged by the switch on the throttle stick).
+bool  holdActive = false;
+float targetAlt = 0;                   // metres we are trying to hold
+float holdBase  = 0;                   // hover thrust (us) captured at engage
+int   holdThrCmd = 0;                  // throttle stick value captured at engage
+int   lastBaseThrottle = 1000;         // previous loop's base (for a smooth handback)
+float iAlt = 0;                        // altitude integral
+const float ALT_CLIMB_RATE  = 1.0;     // m/s of target change at full stick push
+const float ALT_I_LIMIT     = 120.0;   // us
+const float ALT_CORR_LIMIT  = 180.0;   // max |throttle trim| from baro (us)
+
 // ---------------- ESCs ----------------
 Servo esc1, esc2, esc3, esc4;
 const int escPin1 = 14;            // Left Front
@@ -83,6 +106,7 @@ const int maxThrottle = 1800;
 // Live commands from the radio
 int throttleCmd = 0;                 // 0..1023 (throttle stick)
 int yawCmd = 0, pitchCmd = 0, rollCmd = 0;   // -512..511 (centered sticks)
+uint8_t holdCmd = 0;                          // 1 = altitude-hold requested (TX switch)
 
 // ---------------- Stabilization: PID (TUNE THESE) ----------------
 // Roll & pitch run in ANGLE mode (stick = desired lean angle, the IMU holds it).
@@ -96,6 +120,10 @@ PID pidYaw   = { 3.0, 0.0, 0.0 };     // yaw rate hold (P-only is usually enough
 
 float iRoll = 0, iPitch = 0, iYaw = 0;   // integral accumulators (anti-windup clamped)
 const float I_LIMIT = 150.0;             // max |integral| contribution (us)
+
+// Altitude-hold PID (baro). Output is a throttle trim in microseconds around the
+// captured hover point. Baro is noisy so keep these soft; tune kp first.
+PID pidAlt = { 60.0, 25.0, 35.0 };       // kp:us/m  ki:us/(m*s)  kd:us/(m/s)
 
 const float MAX_ANGLE    = 30.0;      // deg of lean at full roll/pitch stick
 const float MAX_YAW_RATE = 150.0;     // deg/s at full yaw stick
@@ -225,6 +253,21 @@ void setup() {
     Serial.println("  unrecognized WHO_AM_I -> tell me this value so I can add support");
   }
 
+  // --- BMP280 barometer (optional): shares the I2C bus; 0x76 (SDO->GND) or 0x77 ---
+  bmpOk = bmp.begin(0x76) || bmp.begin(0x77);
+  if (bmpOk) {
+    bmp.setSampling(Adafruit_BMP280::MODE_NORMAL,
+                    Adafruit_BMP280::SAMPLING_X2,    // temperature
+                    Adafruit_BMP280::SAMPLING_X16,   // pressure (oversample for resolution)
+                    Adafruit_BMP280::FILTER_X16,     // smooth out spikes
+                    Adafruit_BMP280::STANDBY_MS_1);
+    altRaw = altFilt = bmp.readAltitude(SEA_LEVEL_HPA);
+    lastBaroUs = micros();
+    Serial.printf("BMP280 OK -> altitude hold available (ref %.1f m)\n", altFilt);
+  } else {
+    Serial.println("BMP280 not found (0x76/0x77) -> altitude hold disabled (flies normally)");
+  }
+
   esc1.attach(escPin1, 1000, 2000);
   esc2.attach(escPin2, 1000, 2000);
   esc3.attach(escPin3, 1000, 2000);
@@ -239,6 +282,7 @@ void setup() {
   radio.setDataRate(RF24_250KBPS);
   radio.setChannel(76);
   radio.setPALevel(RF24_PA_MIN);
+  radio.setPayloadSize(sizeof(DataPacket));   // fixed-size packets = deterministic link
   radio.openReadingPipe(0, address);
   radio.startListening();
   Serial.print("nRF24 chip connected (SPI ok?): ");
@@ -257,6 +301,7 @@ void loop() {
     yawCmd   = receivedData.yaw;
     pitchCmd = receivedData.pitch;
     rollCmd  = receivedData.roll;
+    holdCmd  = receivedData.hold;
     lastPacketMs = millis();
   }
 
@@ -265,6 +310,7 @@ void loop() {
   // ===== FAILSAFE: no link -> motors off and cut the sticks =====
   if (!signalOk) {
     throttleCmd = 0; yawCmd = pitchCmd = rollCmd = 0;
+    holdCmd = 0; holdActive = false;      // drop altitude hold on signal loss
     baseSmooth = 1000;                    // cut thrust immediately (no ramp)
     iRoll = iPitch = iYaw = 0;            // dump PID integrals so it can't wind up
   }
@@ -287,8 +333,64 @@ void loop() {
   if      (targetBase > baseSmooth + maxStep) baseSmooth += maxStep;
   else if (targetBase < baseSmooth - maxStep) baseSmooth -= maxStep;
   else                                        baseSmooth  = targetBase;
-  int baseThrottle = (int)baseSmooth;
-  bool flying = baseThrottle > minThrottle;   // only stabilize once actually spun up
+
+  bool spunUp   = baseSmooth > minThrottle;   // manual thrust present?
+  bool stickLow = throttleCmd < THR_MIN_ON;   // pilot is holding throttle down
+
+  // ===== BAROMETER (read ~40 Hz) -> filtered altitude + climb rate =====
+  if (bmpOk) {
+    unsigned long bUs = micros();
+    if (bUs - lastBaroUs >= 25000) {                 // 40 Hz
+      float dtB = (bUs - lastBaroUs) * 1e-6f;
+      lastBaroUs = bUs;
+      float a = bmp.readAltitude(SEA_LEVEL_HPA);     // metres (we only use it relatively)
+      if (!isnan(a)) {
+        altRaw = a;
+        float prev = altFilt;
+        altFilt += 0.20f * (altRaw - altFilt);       // low-pass the noisy baro
+        if (dtB > 0.001f && dtB < 0.5f)
+          altVel += 0.25f * (((altFilt - prev) / dtB) - altVel);   // filtered climb rate
+      }
+    }
+  }
+
+  // ===== ALTITUDE HOLD: engage/disengage from the throttle-stick switch =====
+  // Rising edge of the SW button captures the current height + hover thrust.
+  static uint8_t prevHold = 0;
+  bool canHold = bmpOk && signalOk && spunUp && !stickLow;
+  if (holdCmd && !prevHold && canHold) {             // engage
+    holdActive  = true;
+    targetAlt   = altFilt;
+    holdBase    = baseSmooth;
+    holdThrCmd  = throttleCmd;
+    iAlt        = 0;
+  }
+  if (holdActive && (!holdCmd || !signalOk || stickLow)) {   // release / lost / cut
+    holdActive = false;
+    if (signalOk && !stickLow) baseSmooth = (float)lastBaseThrottle;  // smooth handback
+  }
+  prevHold = holdCmd;
+
+  // ===== FINAL motor base: altitude hold overrides the manual throttle =====
+  int baseThrottle;
+  if (holdActive) {
+    // Push the throttle stick away from the engage point to climb/descend
+    // (it slides the target altitude up or down at a gentle rate).
+    int thrDelta = throttleCmd - holdThrCmd;
+    if (thrDelta > 60 || thrDelta < -60)
+      targetAlt += (thrDelta / 512.0f) * ALT_CLIMB_RATE * dt;
+
+    float altErr = targetAlt - altFilt;
+    iAlt = constrain(iAlt + pidAlt.ki * altErr * dt, -ALT_I_LIMIT, ALT_I_LIMIT);
+    float altCorr = pidAlt.kp * altErr + iAlt - pidAlt.kd * altVel;   // D on climb rate
+    altCorr = constrain(altCorr, -ALT_CORR_LIMIT, ALT_CORR_LIMIT);
+    baseThrottle = (int)constrain(holdBase + altCorr, (float)minThrottle, (float)maxThrottle);
+    baseSmooth = baseThrottle;                       // keep the manual smoother in sync
+  } else {
+    baseThrottle = (int)baseSmooth;
+  }
+  lastBaseThrottle = baseThrottle;
+  bool flying = baseThrottle > minThrottle;          // only stabilize once spun up
 
   // ===== IMU: read accel + gyro, fuse into clean angles =====
   if (mpuOk) {
@@ -378,9 +480,9 @@ void loop() {
   static unsigned long dbg = 0;
   if (millis() - dbg > 500) {
     dbg = millis();
-    Serial.printf("link:%d mpu:%d base:%d | T:%d Y:%d P:%d R:%d | ang r=%.1f p=%.1f | corr R:%d P:%d Y:%d | M:%d/%d/%d/%d\n",
-      signalOk, mpuOk, baseThrottle, throttleCmd, yawCmd, pitchCmd, rollCmd,
-      roll, pitch, rollCorr, pitchCorr, yawCorr,
+    Serial.printf("link:%d mpu:%d bmp:%d hold:%d alt:%.2f tgt:%.2f vz:%.2f base:%d | T:%d Y:%d P:%d R:%d | ang r=%.1f p=%.1f | M:%d/%d/%d/%d\n",
+      signalOk, mpuOk, bmpOk, holdActive, altFilt, targetAlt, altVel, baseThrottle,
+      throttleCmd, yawCmd, pitchCmd, rollCmd, roll, pitch,
       motorLeftFront, motorLeftRear, motorRightFront, motorRightRear);
   }
 

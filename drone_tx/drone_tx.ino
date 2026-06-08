@@ -23,11 +23,12 @@
 RF24 radio(NRF_CE, NRF_CSN);
 const byte address[6] = "00001";
 
-struct DataPacket {
+struct __attribute__((packed)) DataPacket {
   uint16_t throttle;   // 0..1023 (not centered)
   int16_t  yaw;        // -512..511 (centered)
   int16_t  pitch;      // -512..511 (centered)
   int16_t  roll;       // -512..511 (centered)
+  uint8_t  hold;       // 1 = altitude-hold switch pressed (throttle-stick button)
 };
 DataPacket data;
 
@@ -41,6 +42,11 @@ const int PIN_THR   = 4;   // GPIO4  ADC1_CH4  throttle  (left stick - vertical)
 const int PIN_YAW   = 3;   // GPIO3  ADC1_CH3  yaw       (left stick - horizontal)
 const int PIN_PITCH = 1;   // GPIO1  ADC1_CH1  pitch     (right stick - vertical)
 const int PIN_ROLL  = 0;   // GPIO0  ADC1_CH0  roll      (right stick - horizontal)
+
+// Push-button switch built into the THROTTLE joystick (KY-023 "SW" pin). Wire it
+// between this pin and GND; the internal pull-up makes it read HIGH when released
+// and LOW when pressed. Each press toggles altitude hold on/off.
+const int PIN_SW    = 21;  // GPIO21  throttle-stick button -> altitude-hold toggle
 
 // Onboard LED (GPIO8, active LOW on the C3 Supermini). Used as a visual
 // calibration heartbeat because the C3's USB serial is hard to read live.
@@ -83,6 +89,8 @@ void initRadio() {
   radio.setDataRate(RF24_250KBPS);
   radio.setChannel(76);
   radio.setPALevel(RF24_PA_MIN);
+  radio.setPayloadSize(sizeof(DataPacket));   // fixed-size packets = deterministic link
+  radio.setRetries(5, 15);                    // 5*250us delay, 15 retries -> robust ACKs
   radio.openWritingPipe(address);
   radio.stopListening();
 }
@@ -105,6 +113,9 @@ void setup() {
   // Pull the throttle pin up: idle is the HIGH end, so a loose/disconnected
   // throttle wire reads idle (=0) and the motors stay OFF instead of floating.
   pinMode(PIN_THR, INPUT_PULLUP);
+
+  // Throttle-stick button -> altitude-hold toggle (active-low with pull-up).
+  pinMode(PIN_SW, INPUT_PULLUP);
 
   // Route SPI to the C3 pins first, then start the radio on that bus.
   SPI.begin(NRF_SCK, NRF_MISO, NRF_MOSI, NRF_CSN);
@@ -132,6 +143,19 @@ void loop() {
   data.pitch    = axisCentered(PIN_PITCH, cPitch);
   data.roll     = axisCentered(PIN_ROLL,  cRoll);
 
+  // Throttle-stick button toggles altitude hold (debounced, one toggle per press).
+  static bool holdState = false;
+  static bool swReading = HIGH, swStable = HIGH;
+  static unsigned long swChanged = 0;
+  bool sw = digitalRead(PIN_SW);
+  if (sw != swReading) { swReading = sw; swChanged = millis(); }
+  if (millis() - swChanged > 30 && sw != swStable) {   // 30 ms debounce
+    swStable = sw;
+    if (swStable == LOW) holdState = !holdState;        // pressed -> toggle
+  }
+  data.hold = holdState ? 1 : 0;
+  digitalWrite(LED_PIN, holdState ? LOW : HIGH);         // LED on = hold engaged
+
   bool ok = radio.write(&data, sizeof(data));   // true only when the FC ACKs
 
   // Auto-reconnect: if the link stays dead, re-init the radio (no reset needed).
@@ -143,8 +167,8 @@ void loop() {
   static unsigned long dbg = 0;
   if (millis() - dbg > 200) {
     dbg = millis();
-    Serial.printf("rawT:%d T:%d Y:%d P:%d R:%d | chip:%d ackOK:%lu fail:%lu\n",
-      rawThr, data.throttle, data.yaw, data.pitch, data.roll,
+    Serial.printf("rawT:%d T:%d Y:%d P:%d R:%d hold:%d | chip:%d ackOK:%lu fail:%lu\n",
+      rawThr, data.throttle, data.yaw, data.pitch, data.roll, data.hold,
       radio.isChipConnected(), okCount, failCount);
   }
 
